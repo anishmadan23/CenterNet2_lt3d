@@ -44,6 +44,7 @@ class CustomROIHeads(StandardROIHeads):
         """
         if not self.debug:
             del images
+
         if self.training:
             assert targets
             proposals = self.label_and_sample_proposals(proposals, targets)

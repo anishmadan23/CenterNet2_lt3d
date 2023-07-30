@@ -27,6 +27,7 @@ def build_custom_augmentation(cfg, is_train):
     Returns:
         list[Augmentation]
     """
+    # import ipdb; ipdb.set_trace()
     if cfg.INPUT.CUSTOM_AUG == 'ResizeShortestEdge':
         if is_train:
             min_size = cfg.INPUT.MIN_SIZE_TRAIN

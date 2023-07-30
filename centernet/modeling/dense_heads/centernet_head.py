@@ -146,6 +146,7 @@ class CenterNetHead(nn.Module):
             feature = self.share_tower(feature)
             cls_tower = self.cls_tower(feature)
             bbox_tower = self.bbox_tower(feature)
+            # import ipdb; ipdb.set_trace()
             if not self.only_proposal:
                 clss.append(self.cls_logits(cls_tower))
             else:

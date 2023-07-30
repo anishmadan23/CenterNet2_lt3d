@@ -7,14 +7,14 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import os
 from detectron2.modeling.proposal_generator.build import PROPOSAL_GENERATOR_REGISTRY
 from detectron2.layers import ShapeSpec, cat
 from detectron2.structures import Instances, Boxes
 from detectron2.modeling import detector_postprocess
 from detectron2.utils.comm import get_world_size
 from detectron2.config import configurable
-
+# from copy import deepcopy
 from ..layers.heatmap_focal_loss import heatmap_focal_loss_jit
 from ..layers.heatmap_focal_loss import binary_heatmap_focal_loss_jit
 from ..layers.iou_loss import IOULoss
@@ -178,9 +178,46 @@ class CenterNet(nn.Module):
                 cfg, [input_shape[f] for f in cfg.MODEL.CENTERNET.IN_FEATURES]),
         }
         return ret
+    
+# def update_targets_with_pseudolabels(targets, file_names, pseudolabel_path, confidence_thresh, iou_thresh=0.5, one_class=False, one_class_id=-1):
+    def update_gt_instances_with_pseudolabels(self, targets, file_names, pseudolabel_path, confidence_thresh, zs_negboxes=False):
+        assert (file_names is not None), "File Names of GT instances can't be None"
 
+        for idx, target_info in enumerate(targets):
+            img_path = file_names[idx]
+            pseudolabel_file = os.path.join(pseudolabel_path, os.path.basename(img_path).replace('.jpg', '.pth'))
+            device = targets[idx]._fields['gt_classes'].device
 
-    def forward(self, images, features_dict, gt_instances):
+            pseudolabels = torch.load(pseudolabel_file, map_location=device)
+            if zs_negboxes:               # using zs boxes not rest of GT annotations
+                selected_inds = torch.where(pseudolabels['scores']>=confidence_thresh)[0]
+                new_boxes = pseudolabels['bboxs'][selected_inds]
+                new_labels = pseudolabels['pred_labels'][selected_inds].long()
+            else:
+                new_boxes = pseudolabels['gt_boxes']
+                new_labels = pseudolabels['gt_classes'].long()
+
+            # import ipdb; ipdb.set_trace()
+
+            # tgt_pseudolabels_pairwise_iou = pairwise_iou(targets[idx]._fields['gt_boxes'], Boxes(new_boxes))    # GT x Num Boxes
+            # maxiou_overlap_gt_new_boxes = torch.max(tgt_pseudolabels_pairwise_iou, dim=0)[0]   # take max across GT => if a box has overlap >iou_thresh with any GT, then no need of adding it to targets
+            # unique_box_inds = torch.where(maxiou_overlap_gt_new_boxes<iou_thresh)[0]
+            # unique_boxes = new_boxes[unique_box_inds]
+            # unique_box_labels = new_labels[unique_box_inds] 
+            # # print('Num Unique Boxes', unique_box_labels.shape)
+            # if one_class:
+            #     new_unique_box_labels = torch.ones_like(unique_box_labels)*one_class_id
+            #     targets[idx]._fields['gt_classes'] = torch.cat([targets[idx]._fields['gt_classes'], new_unique_box_labels])
+            #     # import ipdb; ipdb.set_trace()
+
+            # else:
+            targets[idx]._fields['gt_classes'] = torch.cat([targets[idx]._fields['gt_classes'], new_labels])
+            targets[idx]._fields['gt_boxes'].tensor = torch.cat([targets[idx]._fields['gt_boxes'].tensor, new_boxes])
+
+        return targets
+
+    def forward(self, images, features_dict, gt_instances, negloss_boxes_path=None, file_names=None, zs_conf_thresh=0.0, zs_negboxes=False):
+
         features = [features_dict[f] for f in self.in_features]
         clss_per_level, reg_pred_per_level, agn_hm_pred_per_level = \
             self.centernet_head(features)
@@ -193,9 +230,23 @@ class CenterNet(nn.Module):
                 images, clss_per_level, reg_pred_per_level, 
                 agn_hm_pred_per_level, grids)
         else:
-            pos_inds, labels, reg_targets, flattened_hms = \
-                self._get_ground_truth(
-                    grids, shapes_per_level, gt_instances)
+            # import ipdb; ipdb.set_trace()
+
+            if negloss_boxes_path is not None:
+
+                pos_inds, labels, reg_targets, flattened_hms = \
+                    self._get_ground_truth(
+                        grids, shapes_per_level, gt_instances)
+                
+                augmented_gt_instances = self.update_gt_instances_with_pseudolabels([x.copy_instance() for x in gt_instances], file_names, negloss_boxes_path, zs_conf_thresh, zs_negboxes=zs_negboxes) 
+
+                aug_pos_inds, _, _, augmented_flattened_hms = \
+                    self._get_hm_from_augmented_ground_truth(
+                        grids, shapes_per_level, augmented_gt_instances)
+            else:
+                pos_inds, labels, reg_targets, flattened_hms = \
+                    self._get_ground_truth(
+                        grids, shapes_per_level, gt_instances)
             # logits_pred: M x F, reg_pred: M x 4, agn_hm_pred: M
             logits_pred, reg_pred, agn_hm_pred = self._flatten_outputs(
                 clss_per_level, reg_pred_per_level, agn_hm_pred_per_level)
@@ -206,13 +257,29 @@ class CenterNet(nn.Module):
                 #   2. their regression losses are small (<self.more_pos_thresh)
                 pos_inds, labels = self._add_more_pos(
                     reg_pred, gt_instances, shapes_per_level)
+                
+            if negloss_boxes_path is not None:
+                losses = self.losses(                                                ### only flattened hms is used corresponding to GT+ extra boxes as it is the only thing used for negative loss computation
+                    pos_inds, labels, reg_targets, flattened_hms,
+                    logits_pred, reg_pred, agn_hm_pred, augmented_flattened_hms=augmented_flattened_hms) 
+            else: 
+                losses = self.losses(
+                    pos_inds, labels, reg_targets, flattened_hms,
+                    logits_pred, reg_pred, agn_hm_pred)
             
-            losses = self.losses(
-                pos_inds, labels, reg_targets, flattened_hms,
-                logits_pred, reg_pred, agn_hm_pred)
+            import ipdb; ipdb.set_trace()
+            print('orig', losses)
+            print('loss', self.losses(                                                ### only flattened hms is used corresponding to GT+ extra boxes as it is the only thing used for negative loss computation
+                    pos_inds, labels, reg_targets, flattened_hms,
+                    logits_pred, reg_pred, agn_hm_pred, augmented_flattened_hms=None))
+
+            print('augmented loss', self.losses(                                                ### only flattened hms is used corresponding to GT+ extra boxes as it is the only thing used for negative loss computation
+                    pos_inds, labels, reg_targets, flattened_hms,
+                    logits_pred, reg_pred, agn_hm_pred, augmented_flattened_hms=augmented_flattened_hms))
+            
             
             proposals = None
-            if self.only_proposal:
+            if self.only_proposal:                                        # this is true
                 agn_hm_pred_per_level = [x.sigmoid() for x in agn_hm_pred_per_level]
                 proposals = self.predict_instances(
                     grids, agn_hm_pred_per_level, reg_pred_per_level, 
@@ -240,7 +307,7 @@ class CenterNet(nn.Module):
 
     def losses(
         self, pos_inds, labels, reg_targets, flattened_hms,
-        logits_pred, reg_pred, agn_hm_pred):
+        logits_pred, reg_pred, agn_hm_pred, augmented_flattened_hms=None):
         '''
         Inputs:
             pos_inds: N
@@ -263,7 +330,7 @@ class CenterNet(nn.Module):
             total_num_pos = reduce_sum(
                 pos_inds.new_tensor([num_pos_local])).item()
         num_pos_avg = max(total_num_pos / num_gpus, 1.0)
-
+        # import ipdb; ipdb.set_trace()
         losses = {}
         if not self.only_proposal:
             pos_loss, neg_loss = heatmap_focal_loss_jit(
@@ -297,8 +364,13 @@ class CenterNet(nn.Module):
             reduction='sum') / reg_norm
         losses['loss_centernet_loc'] = reg_loss
 
-        if self.with_agn_hm:
-            cat_agn_heatmap = flattened_hms.max(dim=1)[0] # M
+        if self.with_agn_hm:                                                     # need to edit this as self.only_proposal above is true and therefore the negloss snippet is not exectued above
+            if augmented_flattened_hms is not None:
+                cat_agn_heatmap = augmented_flattened_hms.max(dim=1)[0] # M       more targets here due to GT/Pseudolabels
+            else:
+                cat_agn_heatmap = flattened_hms.max(dim=1)[0] # M
+            print(pos_inds)
+            import ipdb; ipdb.set_trace()
             agn_pos_loss, agn_neg_loss = binary_heatmap_focal_loss_jit(
                 agn_hm_pred.float(), cat_agn_heatmap.float(), pos_inds,
                 alpha=self.hm_focal_alpha, 
@@ -439,6 +511,108 @@ class CenterNet(nn.Module):
         
         return pos_inds, labels, reg_targets, flattened_hms
 
+
+    def _get_hm_from_augmented_ground_truth(self, grids, shapes_per_level, gt_instances):
+        '''
+        Input:
+            grids: list of tensors [(hl x wl, 2)]_l
+            shapes_per_level: list of tuples L x 2:
+            gt_instances: gt instances
+        Retuen:
+            pos_inds: N
+            labels: N
+            reg_targets: M x 4
+            flattened_hms: M x C or M x 1
+            N: number of objects in all images
+            M: number of pixels from all FPN levels
+        '''
+
+        # get positive pixel index
+
+
+        if not self.more_pos:
+            pos_inds, labels = self._get_label_inds(
+                gt_instances, shapes_per_level) 
+        else:
+            pos_inds, labels = None, None
+        heatmap_channels = self.num_classes
+        L = len(grids)
+        num_loc_list = [len(loc) for loc in grids]
+        strides = torch.cat([
+            shapes_per_level.new_ones(num_loc_list[l]) * self.strides[l] \
+            for l in range(L)]).float() # M
+        reg_size_ranges = torch.cat([
+            shapes_per_level.new_tensor(self.sizes_of_interest[l]).float().view(
+            1, 2).expand(num_loc_list[l], 2) for l in range(L)]) # M x 2
+        grids = torch.cat(grids, dim=0) # M x 2
+        M = grids.shape[0]
+
+        reg_targets = []
+        flattened_hms = []
+        for i in range(len(gt_instances)): # images
+            boxes = gt_instances[i].gt_boxes.tensor # N x 4
+            area = gt_instances[i].gt_boxes.area() # N
+            gt_classes = gt_instances[i].gt_classes # N in [0, self.num_classes]
+
+            N = boxes.shape[0]
+            if N == 0:
+                reg_targets.append(grids.new_zeros((M, 4)) - INF)
+                flattened_hms.append(
+                    grids.new_zeros((
+                        M, 1 if self.only_proposal else heatmap_channels)))
+                continue
+            
+            l = grids[:, 0].view(M, 1) - boxes[:, 0].view(1, N) # M x N
+            t = grids[:, 1].view(M, 1) - boxes[:, 1].view(1, N) # M x N
+            r = boxes[:, 2].view(1, N) - grids[:, 0].view(M, 1) # M x N
+            b = boxes[:, 3].view(1, N) - grids[:, 1].view(M, 1) # M x N
+            reg_target = torch.stack([l, t, r, b], dim=2) # M x N x 4
+
+            centers = ((boxes[:, [0, 1]] + boxes[:, [2, 3]]) / 2) # N x 2
+            centers_expanded = centers.view(1, N, 2).expand(M, N, 2) # M x N x 2
+            strides_expanded = strides.view(M, 1, 1).expand(M, N, 2)
+            centers_discret = ((centers_expanded / strides_expanded).int() * \
+                strides_expanded).float() + strides_expanded / 2 # M x N x 2
+            
+            is_peak = (((grids.view(M, 1, 2).expand(M, N, 2) - \
+                centers_discret) ** 2).sum(dim=2) == 0) # M x N
+            is_in_boxes = reg_target.min(dim=2)[0] > 0 # M x N
+            is_center3x3 = self.get_center3x3(
+                grids, centers, strides) & is_in_boxes # M x N
+            is_cared_in_the_level = self.assign_reg_fpn(
+                reg_target, reg_size_ranges) # M x N
+            reg_mask = is_center3x3 & is_cared_in_the_level # M x N
+
+            dist2 = ((grids.view(M, 1, 2).expand(M, N, 2) - \
+                centers_expanded) ** 2).sum(dim=2) # M x N
+            dist2[is_peak] = 0
+            radius2 = self.delta ** 2 * 2 * area # N
+            radius2 = torch.clamp(
+                radius2, min=self.min_radius ** 2)
+            weighted_dist2 = dist2 / radius2.view(1, N).expand(M, N) # M x N            
+            reg_target = self._get_reg_targets(
+                reg_target, weighted_dist2.clone(), reg_mask, area) # M x 4
+
+            if self.only_proposal:
+                flattened_hm = self._create_agn_heatmaps_from_dist(
+                    weighted_dist2.clone()) # M x 1
+            else:
+                flattened_hm = self._create_heatmaps_from_dist(
+                    weighted_dist2.clone(), gt_classes, 
+                    channels=heatmap_channels) # M x C
+
+            reg_targets.append(reg_target)
+            flattened_hms.append(flattened_hm)
+        
+        # transpose im first training_targets to level first ones
+        reg_targets = _transpose(reg_targets, num_loc_list)
+        flattened_hms = _transpose(flattened_hms, num_loc_list)
+        for l in range(len(reg_targets)):
+            reg_targets[l] = reg_targets[l] / float(self.strides[l])
+        reg_targets = cat([x for x in reg_targets], dim=0) # MB x 4
+        flattened_hms = cat([x for x in flattened_hms], dim=0) # MB x C
+        
+        return pos_inds, labels, reg_targets, flattened_hms
 
     def _get_label_inds(self, gt_instances, shapes_per_level):
         '''
