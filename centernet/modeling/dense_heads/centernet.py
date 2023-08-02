@@ -248,7 +248,7 @@ class CenterNet(nn.Module):
         return targets
 
 
-    def forward(self, images, features_dict, gt_instances, negloss_boxes_path=None, file_names=None, zs_conf_thresh=None, zs_negboxes=None):
+    def forward(self, images, features_dict, gt_instances, file_names=None, negloss_boxes_path=None, zs_conf_thresh=None, zs_negboxes=None):
         features = [features_dict[f] for f in self.in_features]
         clss_per_level, reg_pred_per_level, agn_hm_pred_per_level = \
             self.centernet_head(features)
@@ -261,6 +261,7 @@ class CenterNet(nn.Module):
                 images, clss_per_level, reg_pred_per_level, 
                 agn_hm_pred_per_level, grids)
         else:
+            # import ipdb; ipdb.set_trace()
             if negloss_boxes_path is not None:
                 pos_inds, labels, reg_targets, flattened_hms = \
                     self._get_ground_truth(
@@ -277,6 +278,7 @@ class CenterNet(nn.Module):
                 pos_inds, labels, reg_targets, flattened_hms = \
                     self._get_ground_truth(
                         grids, shapes_per_level, gt_instances)
+                augmented_flattened_hms=None
             # logits_pred: M x F, reg_pred: M x 4, agn_hm_pred: M
             logits_pred, reg_pred, agn_hm_pred = self._flatten_outputs(
                 clss_per_level, reg_pred_per_level, agn_hm_pred_per_level)
